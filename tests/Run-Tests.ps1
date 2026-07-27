@@ -421,23 +421,26 @@ Check 'действующий псевдоним остался' (@($al | Where-
 
 ''
 '============================================================'
-'ТЕСТ 16. Реальная структура: «Все сотрудники» и «Руководство»'
+'ТЕСТ 16. Реальная структура: вершина «Все сотрудники» и «Руководство»'
 '============================================================'
-# В 1С вершина иерархии — «Руководство»: все отделы указывают его как objName.
-# В AD дерево устроено иначе: «Руководство» и все отделы вложены напрямую
-# в «Все сотрудники», а внутри «Руководства» не должно быть ничего.
+# В 1С вершина иерархии — «Руководство»: отделы указывают его как objName.
+# В AD дерево устроено иначе: «Руководство» и все его отделы вложены напрямую
+# во «Все сотрудники», а внутри «Руководства» только его собственные сотрудники.
 Reset-Store
 Set-Excel @(
-    @{ Child = 'Отдел продаж';  Parent = 'Руководство'; Manager = '1001' },
-    @{ Child = 'Отдел закупок'; Parent = 'Руководство'; Manager = '2001' }
+    @{ Child = 'Отдел продаж';   Parent = 'Руководство';  Manager = '1001' },
+    @{ Child = 'Отдел закупок';  Parent = 'Руководство';  Manager = '2001' },
+    @{ Child = 'Группа логистики'; Parent = 'Отдел закупок'; Manager = '2001' }
 )
-Add-User -Sam 'boss.sales' -Name 'Руководитель Продаж'  -Dept 'Отдел продаж'  -EmpNum '1001'
-Add-User -Sam 'boss.purch' -Name 'Руководитель Закупок' -Dept 'Отдел закупок' -EmpNum '2001'
-Add-User -Sam 'ceo'        -Name 'Генеральный'          -Dept 'Руководство'   -EmpNum '1'
+Add-User -Sam 'boss.sales' -Name 'Руководитель Продаж'  -Dept 'Отдел продаж'    -EmpNum '1001'
+Add-User -Sam 'boss.purch' -Name 'Руководитель Закупок' -Dept 'Отдел закупок'   -EmpNum '2001'
+Add-User -Sam 'ceo'        -Name 'Генеральный'          -Dept 'Руководство'     -EmpNum '1'
+Add-User -Sam 'log1'       -Name 'Логист Один'          -Dept 'Группа логистики' -EmpNum '3001'
 for ($i = 1; $i -lt 12; $i++) { Add-User -Sam "sales$i" -Name "Продавец $i" -Dept 'Отдел продаж'  -EmpNum "10$i" }
 for ($i = 1; $i -lt 5;  $i++) { Add-User -Sam "purch$i" -Name "Закупщик $i" -Dept 'Отдел закупок' -EmpNum "20$i" }
 
-# Корень дерева заведён руками и в выгрузке 1С не встречается.
+# Вершина заведена руками и в выгрузке 1С не встречается. Изначально пуста —
+# скрипт должен собрать её сам.
 $global:ADStore.Groups += [PSCustomObject]@{
     DistinguishedName = "CN=Все сотрудники,$OU"
     Name = 'Все сотрудники'; SamAccountName = 'DG_VS'; DisplayName = 'Все сотрудники'
@@ -448,31 +451,56 @@ $global:ADStore.Groups += [PSCustomObject]@{
 }
 Invoke-Sync
 
-Check 'в «Руководство» не вложено ни одной группы' (@((Get-Mem 'Руководство') | Where-Object { $_ -like 'CN=*Отдел*' }).Count -eq 0) "= $(@((Get-Mem 'Руководство') | Where-Object { $_ -like 'CN=*Отдел*' }).Count)"
+function Get-RootChildNames {
+    $dns = @((Get-G 'Все сотрудники').Member)
+    @($global:ADStore.Groups | Where-Object { $dns -contains $_.DistinguishedName } |
+      ForEach-Object { $_.Name }) | Sort-Object
+}
+$rootNames = Get-RootChildNames
+Check 'вершина собрана: Руководство + два отдела' (($rootNames -join ',') -eq 'Отдел закупок,Отдел продаж,Руководство') "= $($rootNames -join ',')"
+Check 'вложенная «Группа логистики» в вершину не попала' (-not ($rootNames -contains 'Группа логистики'))
+Check '«Группа логистики» осталась в «Отделе закупок»' (@((Get-Mem 'Отдел закупок')) -contains (Get-G 'Группа логистики').DistinguishedName)
+Check 'в «Руководство» не вложено ни одной группы' (@((Get-Mem 'Руководство') | Where-Object { $managedDns = @($global:ADStore.Groups | ForEach-Object { $_.DistinguishedName }); $managedDns -contains $_ }).Count -eq 0)
 Check 'сотрудники «Руководства» на месте' ((Get-MemSams 'Руководство') -contains 'ceo')
-Check 'группа «Все сотрудники» цела' ($null -ne (Get-G 'Все сотрудники'))
-Check 'состав «Все сотрудники» не тронут' (@((Get-G 'Все сотрудники').Member).Count -eq 0)
+Check 'состав «Руководства» ровно из одного человека' ((Get-MemSams 'Руководство').Count -eq 1) "= $((Get-MemSams 'Руководство').Count)"
 Check '«Все сотрудники» не в карантине' (-not (Get-G 'Все сотрудники').info)
 Check '«Все сотрудники» не скрыты из адресной книги' (-not (Get-G 'Все сотрудники').HiddenFromAddressListsEnabled)
 Check '«Все сотрудники» нет в реестре' (@(Read-Json 'department_registry.json' | Where-Object { $_.Sam -eq 'DG_VS' }).Count -eq 0)
 Check 'нет жалоб про ненайденного родителя' (-not ($script:LastOutput -match 'Родитель .* не найден'))
 
-# Ручную вложенность в корень скрипт не должен ни создавать, ни разрушать.
-$root = Get-G 'Все сотрудники'
-foreach ($n in @('Руководство','Отдел продаж','Отдел закупок')) {
-    $child = Get-G $n
-    $root.Member    += $child.DistinguishedName
-    $child.MemberOf += $root.DistinguishedName
-}
+# Повторный прогон ничего не меняет.
 Invoke-Sync
-Check 'ручная вложенность в корень сохранена' (@((Get-G 'Все сотрудники').Member).Count -eq 3) "= $(@((Get-G 'Все сотрудники').Member).Count)"
-Check 'в «Руководство» по-прежнему нет групп' (@((Get-Mem 'Руководство') | Where-Object { $_ -like 'CN=*Отдел*' }).Count -eq 0)
+Check 'вершина стабильна при повторном прогоне' (((Get-RootChildNames) -join ',') -eq 'Отдел закупок,Отдел продаж,Руководство')
 
-# Уже вложенные ранее группы вычищаются из «Руководства».
-$ruk = Get-G 'Руководство'
-$ruk.Member += (Get-G 'Отдел продаж').DistinguishedName
+# Новый отдел под «Руководством» подхватывается вершиной сам.
+Set-Excel @(
+    @{ Child = 'Отдел продаж';     Parent = 'Руководство';   Manager = '1001' },
+    @{ Child = 'Отдел закупок';    Parent = 'Руководство';   Manager = '2001' },
+    @{ Child = 'Группа логистики'; Parent = 'Отдел закупок'; Manager = '2001' },
+    @{ Child = 'Отдел маркетинга'; Parent = 'Руководство';   Manager = '1001' }
+)
+Add-User -Sam 'mkt1' -Name 'Маркетолог Один' -Dept 'Отдел маркетинга' -EmpNum '4001'
 Invoke-Sync
-Check 'ошибочно вложенная группа убрана из «Руководства»' (@((Get-Mem 'Руководство') | Where-Object { $_ -like 'CN=*Отдел*' }).Count -eq 0)
+Check 'новый отдел сам попал в вершину' ((Get-RootChildNames) -contains 'Отдел маркетинга')
+
+# Постороннего члена вершины скрипт не трогает: это не его группа.
+$foreign = [PSCustomObject]@{
+    DistinguishedName = 'CN=FOREIGN-GROUP,OU=Other,DC=transitcard,DC=ru'
+    Name = 'FOREIGN-GROUP'; SamAccountName = 'FOREIGN'; DisplayName = 'FOREIGN-GROUP'
+    Description = 'Чужая группа'; Member = @(); MemberOf = @(); ManagedBy = $null
+    mail = $null; info = $null; whenCreated = (Get-Date).AddDays(-10)
+    objectSid = [PSCustomObject]@{ Value = 'S-1-5-21-1-1-1-600' }
+    HiddenFromAddressListsEnabled = $false
+}
+$global:ADStore.Groups += $foreign
+(Get-G 'Все сотрудники').Member += $foreign.DistinguishedName
+Invoke-Sync
+Check 'посторонний член вершины не удалён' (@((Get-G 'Все сотрудники').Member) -contains $foreign.DistinguishedName)
+
+# Ошибочно вложенная в «Руководство» группа вычищается.
+(Get-G 'Руководство').Member += (Get-G 'Отдел продаж').DistinguishedName
+Invoke-Sync
+Check 'ошибочно вложенная группа убрана из «Руководства»' (-not (@((Get-Mem 'Руководство')) -contains (Get-G 'Отдел продаж').DistinguishedName))
 Check 'при этом «Отдел продаж» не пострадал' ((Get-MemSams 'Отдел продаж').Count -eq 12) "= $((Get-MemSams 'Отдел продаж').Count)"
 
 ''

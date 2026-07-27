@@ -43,6 +43,10 @@ function Get-ADGroup {
         $dn = $matches[1]
         $result = @($result | Where-Object { $_.DisplayName -eq $dn })
     }
+    if ($Filter -and ($Filter -match "Name -eq '([^']+)'")) {
+        $nm = $matches[1]
+        $result = @($result | Where-Object { $_.Name -eq $nm })
+    }
     if ($Identity) {
         $g = script:Find-Group $Identity
         if (-not $g) { throw "Cannot find an object with identity: '$Identity'" }

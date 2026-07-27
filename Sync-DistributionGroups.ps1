@@ -45,20 +45,23 @@ param(
     [int]$SamMaxLength               = 20,
     [string]$UsersCorpOU             = 'OU=Users.Corp,DC=transitcard,DC=ru',
 
-    # Группы, которых синхронизация не касается вообще. «Все сотрудники» — вершина
-    # дерева рассылки: в неё вложены «Руководство» и все отделы. В выгрузке 1С такого
-    # узла нет и не будет — он остался со времён рукописного файла иерархии
-    # ImportedDeps.csv, от которого отказались в пользу Подразделения.xlsx.
-    # Группа ведётся вручную и не меняется, поэтому исключается на всех шагах:
-    # ни состава, ни переименования, ни карантина, ни записей в файлы состояния.
-    [string[]]$IgnoredGroups         = @('Все сотрудники'),
+    # Вершина дерева рассылки. В выгрузке 1С такого узла нет и не будет — он остался
+    # со времён рукописного файла иерархии ImportedDeps.csv, от которого отказались
+    # в пользу Подразделения.xlsx. Как подразделение группа не управляется совсем:
+    # ни создания, ни переименования, ни карантина, ни записей в файлы состояния.
+    # Ведётся у неё только вложенность (шаг 2.1).
+    [string]$RootGroupName           = 'Все сотрудники',
 
     # Подразделения, внутрь которых не вкладываются дочерние группы. «Руководство» —
     # вершина иерархии в выгрузке 1С, поэтому по справочнику в него попадали бы все
-    # отделы. В AD дерево устроено иначе: и «Руководство», и все отделы вложены
-    # напрямую в «Все сотрудники». Сама группа при этом обычная и управляется как все:
+    # отделы. В AD дерево устроено иначе: и «Руководство», и его отделы вложены
+    # напрямую в вершину. Сама группа при этом обычная и управляется как все:
     # исключение отменяет только вложенность, но не состав из сотрудников.
     [string[]]$NoChildGroups         = @('Руководство'),
+
+    # Прочие группы, которых синхронизация не касается вообще (вершина добавляется
+    # к этому списку автоматически).
+    [string[]]$IgnoredGroups         = @(),
 
     # --- Файлы состояния ---
     [string]$AliasesJsonPath         = 'D:\Scripts\Группы рассылки\department_aliases.json',
@@ -164,7 +167,7 @@ function Normalize-Name {
 }
 
 $script:IgnoredKeys = @{}
-foreach ($n in $IgnoredGroups) {
+foreach ($n in (@($IgnoredGroups) + @($RootGroupName))) {
     if ($n -match '\S') { $script:IgnoredKeys[(Normalize-Name $n)] = $true }
 }
 
@@ -394,6 +397,7 @@ try {
     Import-Module ImportExcel
 
     $excelHierarchy  = New-Object System.Collections.Generic.List[object]
+    $rootChildren    = New-Object System.Collections.Generic.List[string]
     $excelManagers   = New-Object System.Collections.Generic.List[object]
     $departmentList  = New-Object System.Collections.Generic.List[string]
     $seenDept        = @{}   # нормализованное имя -> $true (дедупликация)
@@ -417,12 +421,15 @@ try {
 
         if ($childName -and $parentName -and ($childName -ne $parentName)) {
             $parentKey = Normalize-Name $parentName
-            # Вершину запоминаем всегда: она нужна как признак при распознавании
-            # переименований. А вот вкладывать группы в исключённые и в помеченные
-            # «без дочерних» не будем — там дерево собрано вручную по-своему.
+            # Вышестоящее подразделение запоминаем всегда: оно нужно как признак
+            # при распознавании переименований.
             $deptParentByKey[(Normalize-Name $childName)] = $parentName
-            if (-not $script:IgnoredKeys.ContainsKey($parentKey) -and
-                -not $script:NoChildKeys.ContainsKey($parentKey)) {
+
+            if ($script:NoChildKeys.ContainsKey($parentKey)) {
+                # Вложенность в «Руководство» отменена, но отдел не остаётся без места:
+                # по структуре AD он подвешивается прямо к вершине дерева (шаг 2.1).
+                $rootChildren.Add($childName)
+            } elseif (-not $script:IgnoredKeys.ContainsKey($parentKey)) {
                 $excelHierarchy.Add([PSCustomObject]@{ Child = $childName; Parent = $parentName })
             }
         }
@@ -1096,6 +1103,56 @@ Department -like '*'
             }
         }
         Write-Log ("Изменено групп: {0}; исключено членств: {1} из {2}" -f $plan.Count, $totalToRemove, $totalCurrent) 'OK'
+    }
+
+    # ==========================================
+    # ШАГ 2.1. Вершина дерева рассылки
+    # ==========================================
+    # Вершина ведётся отдельно от подразделений: в 1С её нет, и как подразделение
+    # она не управляется. Внутрь складываются группы из $NoChildGroups и те отделы,
+    # чью вложенность в них отменили, — то есть «Руководство» и всё, у чего в выгрузке
+    # вышестоящим подразделением указано «Руководство».
+    # Посторонние члены вершины не трогаются: убираем только свои группы рассылки.
+    if ($RootGroupName -match '\S') {
+        Write-Log "Шаг 2.1: вершина дерева «$RootGroupName»" 'STEP'
+        $rootGroup = Get-ADGroup -Filter "Name -eq '$RootGroupName'" -SearchBase $TargetOU `
+                                 -Server $DcServer -Properties Member -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+        if (-not $rootGroup) {
+            Write-Log "Группа «$RootGroupName» не найдена в $TargetOU — вложенность не ведётся." 'WARN'
+        } else {
+            $rootDesired = @{}
+            foreach ($name in (@($NoChildGroups) + $rootChildren)) {
+                $k = Normalize-Name $name
+                if ($managedGroupsMap.ContainsKey($k)) {
+                    $rootDesired[$managedGroupsMap[$k].DistinguishedName] = $true
+                } elseif ($name -match '\S') {
+                    Write-Log "Для вершины не найдена группа '$name'" 'WARN'
+                }
+            }
+
+            $rootCurrent = @{}
+            foreach ($dn in $rootGroup.Member) { $rootCurrent[$dn] = $true }
+
+            $rootAdd = @($rootDesired.Keys | Where-Object { -not $rootCurrent.ContainsKey($_) })
+            $rootDel = @($rootCurrent.Keys | Where-Object {
+                $managedGroupDNs.ContainsKey($_) -and -not $rootDesired.ContainsKey($_)
+            })
+
+            if ($rootAdd.Count -gt 0 -and $PSCmdlet.ShouldProcess($RootGroupName, "Add $($rootAdd.Count) groups")) {
+                try {
+                    Add-ADGroupMember -Identity $rootGroup -Members $rootAdd -Server $DcServer
+                    Write-Log "+$($rootAdd.Count) групп -> $RootGroupName" 'OK'
+                } catch { Write-Log "Add fail ${RootGroupName}: $($_.Exception.Message)" 'ERROR' }
+            }
+            if ($rootDel.Count -gt 0 -and $PSCmdlet.ShouldProcess($RootGroupName, "Remove $($rootDel.Count) groups")) {
+                try {
+                    Remove-ADGroupMember -Identity $rootGroup -Members $rootDel -Server $DcServer -Confirm:$false
+                    Write-Log "-$($rootDel.Count) групп <- $RootGroupName" 'OK'
+                } catch { Write-Log "Remove fail ${RootGroupName}: $($_.Exception.Message)" 'ERROR' }
+            }
+            Write-Log ("Вершина: {0} групп рассылки внутри" -f $rootDesired.Count) 'OK'
+        }
     }
 
     # ==========================================
