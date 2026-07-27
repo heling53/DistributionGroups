@@ -421,11 +421,23 @@ Check 'действующий псевдоним остался' (@($al | Where-
 
 ''
 '============================================================'
-'ТЕСТ 16. Структурный узел «Все сотрудники» вне 1С не трогается'
+'ТЕСТ 16. Реальная структура: «Все сотрудники» и «Руководство»'
 '============================================================'
-Reset-Store; Build-BaseOrg; Invoke-Sync
-# Корень дерева рассылки заведён руками: его нет и не будет в выгрузке 1С,
-# а внутрь него вложены «Руководство» и все отделы (но не друг в друга).
+# В 1С вершина иерархии — «Руководство»: все отделы указывают его как objName.
+# В AD дерево устроено иначе: «Руководство» и все отделы вложены напрямую
+# в «Все сотрудники», а внутри «Руководства» не должно быть ничего.
+Reset-Store
+Set-Excel @(
+    @{ Child = 'Отдел продаж';  Parent = 'Руководство'; Manager = '1001' },
+    @{ Child = 'Отдел закупок'; Parent = 'Руководство'; Manager = '2001' }
+)
+Add-User -Sam 'boss.sales' -Name 'Руководитель Продаж'  -Dept 'Отдел продаж'  -EmpNum '1001'
+Add-User -Sam 'boss.purch' -Name 'Руководитель Закупок' -Dept 'Отдел закупок' -EmpNum '2001'
+Add-User -Sam 'ceo'        -Name 'Генеральный'          -Dept 'Руководство'   -EmpNum '1'
+for ($i = 1; $i -lt 12; $i++) { Add-User -Sam "sales$i" -Name "Продавец $i" -Dept 'Отдел продаж'  -EmpNum "10$i" }
+for ($i = 1; $i -lt 5;  $i++) { Add-User -Sam "purch$i" -Name "Закупщик $i" -Dept 'Отдел закупок' -EmpNum "20$i" }
+
+# Корень дерева заведён руками и в выгрузке 1С не встречается.
 $global:ADStore.Groups += [PSCustomObject]@{
     DistinguishedName = "CN=Все сотрудники,$OU"
     Name = 'Все сотрудники'; SamAccountName = 'DG_VS'; DisplayName = 'Все сотрудники'
@@ -434,36 +446,34 @@ $global:ADStore.Groups += [PSCustomObject]@{
     objectSid = [PSCustomObject]@{ Value = 'S-1-5-21-1-1-1-500' }
     HiddenFromAddressListsEnabled = $false
 }
+Invoke-Sync
+
+Check 'в «Руководство» не вложено ни одной группы' (@((Get-Mem 'Руководство') | Where-Object { $_ -like 'CN=*Отдел*' }).Count -eq 0) "= $(@((Get-Mem 'Руководство') | Where-Object { $_ -like 'CN=*Отдел*' }).Count)"
+Check 'сотрудники «Руководства» на месте' ((Get-MemSams 'Руководство') -contains 'ceo')
+Check 'группа «Все сотрудники» цела' ($null -ne (Get-G 'Все сотрудники'))
+Check 'состав «Все сотрудники» не тронут' (@((Get-G 'Все сотрудники').Member).Count -eq 0)
+Check '«Все сотрудники» не в карантине' (-not (Get-G 'Все сотрудники').info)
+Check '«Все сотрудники» не скрыты из адресной книги' (-not (Get-G 'Все сотрудники').HiddenFromAddressListsEnabled)
+Check '«Все сотрудники» нет в реестре' (@(Read-Json 'department_registry.json' | Where-Object { $_.Sam -eq 'DG_VS' }).Count -eq 0)
+Check 'нет жалоб про ненайденного родителя' (-not ($script:LastOutput -match 'Родитель .* не найден'))
+
+# Ручную вложенность в корень скрипт не должен ни создавать, ни разрушать.
 $root = Get-G 'Все сотрудники'
-foreach ($n in @('Отдел продаж','Отдел закупок','Коммерческий блок')) {
+foreach ($n in @('Руководство','Отдел продаж','Отдел закупок')) {
     $child = Get-G $n
-    $root.Member   += $child.DistinguishedName
+    $root.Member    += $child.DistinguishedName
     $child.MemberOf += $root.DistinguishedName
 }
-$sidRoot = $root.objectSid.Value
 Invoke-Sync
-Check 'структурный узел опознан' ($script:LastOutput -match 'Структурный узел')
-Check 'корень жив' ($null -ne (Get-G 'Все сотрудники'))
-Check 'корень не в карантине' (-not (Get-G 'Все сотрудники').info)
-Check 'корень не скрыт из адресной книги' (-not (Get-G 'Все сотрудники').HiddenFromAddressListsEnabled)
-Check 'ручная вложенность сохранена (3 группы)' (@((Get-G 'Все сотрудники').Member).Count -eq 3) "= $(@((Get-G 'Все сотрудники').Member).Count)"
-Check 'в реестре помечен как Structural' (@(Read-Json 'department_registry.json' | Where-Object { $_.Sam -eq 'DG_VS' }).Status -eq 'Structural')
+Check 'ручная вложенность в корень сохранена' (@((Get-G 'Все сотрудники').Member).Count -eq 3) "= $(@((Get-G 'Все сотрудники').Member).Count)"
+Check 'в «Руководство» по-прежнему нет групп' (@((Get-Mem 'Руководство') | Where-Object { $_ -like 'CN=*Отдел*' }).Count -eq 0)
 
-# Отдел расформирован: корень не должен быть принят за кандидата на переименование.
-Set-Excel @( @{ Child = 'Отдел закупок'; Parent = 'Коммерческий блок'; Manager = '2001' } )
-Move-Users -Sams (@('boss.sales') + (1..11 | ForEach-Object { "sales$_" })) -ToDept 'Отдел закупок'
+# Уже вложенные ранее группы вычищаются из «Руководства».
+$ruk = Get-G 'Руководство'
+$ruk.Member += (Get-G 'Отдел продаж').DistinguishedName
 Invoke-Sync
-Check 'корень не переименован в исчезнувший отдел' ((Get-G 'Все сотрудники').objectSid.Value -eq $sidRoot)
-(Get-G 'Отдел продаж').info = "QUARANTINE:{0:yyyy-MM-dd}" -f (Get-Date).AddDays(-40)
-Invoke-Sync
-Check 'после чужого удаления корень цел' ($null -ne (Get-G 'Все сотрудники'))
-Check 'корень так и не в карантине' (-not (Get-G 'Все сотрудники').info)
-
-# Корень временно опустошили руками — защита держится по реестру.
-(Get-G 'Все сотрудники').Member = @()
-Invoke-Sync
-Check 'пустой корень защищён реестром' ($null -ne (Get-G 'Все сотрудники'))
-Check 'пустой корень не в карантине' (-not (Get-G 'Все сотрудники').info)
+Check 'ошибочно вложенная группа убрана из «Руководства»' (@((Get-Mem 'Руководство') | Where-Object { $_ -like 'CN=*Отдел*' }).Count -eq 0)
+Check 'при этом «Отдел продаж» не пострадал' ((Get-MemSams 'Отдел продаж').Count -eq 12) "= $((Get-MemSams 'Отдел продаж').Count)"
 
 ''
 '============================================================'

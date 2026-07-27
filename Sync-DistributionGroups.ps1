@@ -45,6 +45,21 @@ param(
     [int]$SamMaxLength               = 20,
     [string]$UsersCorpOU             = 'OU=Users.Corp,DC=transitcard,DC=ru',
 
+    # Группы, которых синхронизация не касается вообще. «Все сотрудники» — вершина
+    # дерева рассылки: в неё вложены «Руководство» и все отделы. В выгрузке 1С такого
+    # узла нет и не будет — он остался со времён рукописного файла иерархии
+    # ImportedDeps.csv, от которого отказались в пользу Подразделения.xlsx.
+    # Группа ведётся вручную и не меняется, поэтому исключается на всех шагах:
+    # ни состава, ни переименования, ни карантина, ни записей в файлы состояния.
+    [string[]]$IgnoredGroups         = @('Все сотрудники'),
+
+    # Подразделения, внутрь которых не вкладываются дочерние группы. «Руководство» —
+    # вершина иерархии в выгрузке 1С, поэтому по справочнику в него попадали бы все
+    # отделы. В AD дерево устроено иначе: и «Руководство», и все отделы вложены
+    # напрямую в «Все сотрудники». Сама группа при этом обычная и управляется как все:
+    # исключение отменяет только вложенность, но не состав из сотрудников.
+    [string[]]$NoChildGroups         = @('Руководство'),
+
     # --- Файлы состояния ---
     [string]$AliasesJsonPath         = 'D:\Scripts\Группы рассылки\department_aliases.json',
     [string]$RegistryJsonPath        = 'D:\Scripts\Группы рассылки\department_registry.json',
@@ -146,6 +161,24 @@ function Normalize-Name {
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return '' }
     return ($Text -replace '\s+', ' ').Trim().ToLowerInvariant()
+}
+
+$script:IgnoredKeys = @{}
+foreach ($n in $IgnoredGroups) {
+    if ($n -match '\S') { $script:IgnoredKeys[(Normalize-Name $n)] = $true }
+}
+
+$script:NoChildKeys = @{}
+foreach ($n in $NoChildGroups) {
+    if ($n -match '\S') { $script:NoChildKeys[(Normalize-Name $n)] = $true }
+}
+
+# Отсев исключённых групп. Применяется сразу после каждого чтения из AD, чтобы
+# ни один шаг такую группу даже не увидел: так исключение нельзя случайно
+# обойти, добавив новый шаг.
+function Remove-IgnoredGroups {
+    param($Groups)
+    return @($Groups | Where-Object { -not $script:IgnoredKeys.ContainsKey((Normalize-Name $_.Name)) })
 }
 
 function Get-UniqueSamAccountName {
@@ -378,9 +411,20 @@ try {
             if ($en -eq '0000-00013') { $en } else { $en -replace '^0+', '' }
         } else { $null }
 
+        # Строки, ссылающиеся на исключённые группы, не берём: иначе шаг 2 будет
+        # каждый прогон писать «родитель не найден» про группу, которой и не должно быть.
+        if ($childName -and $script:IgnoredKeys.ContainsKey((Normalize-Name $childName))) { continue }
+
         if ($childName -and $parentName -and ($childName -ne $parentName)) {
-            $excelHierarchy.Add([PSCustomObject]@{ Child = $childName; Parent = $parentName })
+            $parentKey = Normalize-Name $parentName
+            # Вершину запоминаем всегда: она нужна как признак при распознавании
+            # переименований. А вот вкладывать группы в исключённые и в помеченные
+            # «без дочерних» не будем — там дерево собрано вручную по-своему.
             $deptParentByKey[(Normalize-Name $childName)] = $parentName
+            if (-not $script:IgnoredKeys.ContainsKey($parentKey) -and
+                -not $script:NoChildKeys.ContainsKey($parentKey)) {
+                $excelHierarchy.Add([PSCustomObject]@{ Child = $childName; Parent = $parentName })
+            }
         }
         if ($childName -and $managerEN) {
             $excelManagers.Add([PSCustomObject]@{ Department = $childName; EmployeeNumber = $managerEN })
@@ -391,6 +435,7 @@ try {
         foreach ($name in @($childName, $parentName)) {
             if (-not [string]::IsNullOrWhiteSpace($name)) {
                 $norm = Normalize-Name $name
+                if ($script:IgnoredKeys.ContainsKey($norm)) { continue }
                 if (-not $seenDept.ContainsKey($norm)) {
                     $seenDept[$norm] = $true
                     $departmentList.Add($name)
@@ -514,9 +559,9 @@ Department -like '*'
     # снимок подразделений на прошлую синхронизацию, и это единственная опора.
     Write-Log "Шаг 0: распознавание переименований подразделений" 'STEP'
 
-    $adGroups = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" -SearchBase $TargetOU -Server $DcServer `
+    $adGroups = Remove-IgnoredGroups (Get-ADGroup -LDAPFilter "(description=$GroupDesc)" -SearchBase $TargetOU -Server $DcServer `
                             -Properties Name, DisplayName, SamAccountName, mail, Member, MemberOf, `
-                                        ManagedBy, whenCreated, info, objectSid
+                                        ManagedBy, whenCreated, info, objectSid)
 
     $groupNameByDN = @{}
     $managedDNs    = @{}
@@ -577,10 +622,6 @@ Department -like '*'
             QuarantineSince = $quarantineSince
             KnownNames      = $knownNames
             ExternalParents = @($g.MemberOf | Where-Object { -not $managedDNs.ContainsKey($_) })
-            # Сколько групп рассылки вложено внутрь. Ненулевое значение означает узел
-            # структуры рассылки, а не подразделение: такие узлы (например, общая
-            # группа «все сотрудники») в выгрузке 1С не встречаются в принципе.
-            ChildGroups     = @($g.Member | Where-Object { $managedDNs.ContainsKey($_) }).Count
             AgeDays         = if ($g.whenCreated) { ((Get-Date) - $g.whenCreated).TotalDays } else { [double]::MaxValue }
         }
         $groupInfo.Add($obj)
@@ -595,31 +636,11 @@ Department -like '*'
         return $protectedByEmail.ContainsKey($GroupObj.Mail.ToLowerInvariant().Trim())
     }
 
-    # Структурный узел — группа, внутрь которой вложены другие группы рассылки, но
-    # которой самой нет в 1С. Такие узлы заводят руками (исторически — через отдельный
-    # файл иерархии ImportedDeps.csv, от которого отказались в пользу выгрузки 1С),
-    # и в справочнике они не появятся никогда. Ни переименовывать их, ни гасить,
-    # ни удалять нельзя: под ними висит всё дерево рассылки.
-    # Признак берём и из текущего состава, и из реестра: узел, однажды опознанный
-    # структурным, остаётся защищённым, даже если его временно опустошили руками.
-    $structural = @($groupInfo | Where-Object {
-        (-not $excelGroupKeys.ContainsKey($_.Key)) -and
-        ($_.ChildGroups -gt 0 -or
-         ($registry.ContainsKey($_.Sam) -and $registry[$_.Sam].Status -eq 'Structural'))
-    })
-    $structuralKeys = @{}
-    foreach ($s in $structural) {
-        $structuralKeys[$s.Key] = $true
-        Write-Log ("Структурный узел (нет в 1С, вложено групп: {0}) — не трогаем: {1}" -f $s.ChildGroups, $s.Name) 'WARN'
-    }
-
     # Осиротевшая группа — та, чьего названия больше нет в выгрузке 1С. Именно это
     # событие отличает переименование от перевода сотрудника: при переводе исходное
     # подразделение остаётся в справочнике, и уход одного человека ничего не значит.
     $orphans = @($groupInfo | Where-Object {
-        (-not $excelGroupKeys.ContainsKey($_.Key)) -and
-        (-not $structuralKeys.ContainsKey($_.Key)) -and
-        -not (Test-Protected $_)
+        (-not $excelGroupKeys.ContainsKey($_.Key)) -and -not (Test-Protected $_)
     })
 
     # Получателем может быть подразделение, у которого группы ещё нет, либо у которого
@@ -900,9 +921,9 @@ Department -like '*'
     # ==========================================
     Write-Log "Шаг 1: создание групп из справочника 1С" 'STEP'
 
-    $existingGroups = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
+    $existingGroups = Remove-IgnoredGroups (Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
                                   -SearchBase $TargetOU -Server $DcServer `
-                                  -Properties Name, SamAccountName, mail, DisplayName, Member
+                                  -Properties Name, SamAccountName, mail, DisplayName, Member)
     $groupsByName = @{}
     $usedSam      = @{}
     foreach ($g in $existingGroups) {
@@ -957,9 +978,9 @@ Department -like '*'
     # прогона и оставляла бы группы пустыми, если прогон прервался на середине.
     Write-Log "Шаг 2: приведение состава групп к целевому" 'STEP'
 
-    $managedGroups = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
+    $managedGroups = Remove-IgnoredGroups (Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
                                  -SearchBase $TargetOU -Server $DcServer `
-                                 -Properties Member, mail, Name, SamAccountName, info, objectSid
+                                 -Properties Member, mail, Name, SamAccountName, info, objectSid)
     $managedGroupsMap = @{}
     $managedGroupDNs  = @{}
     foreach ($g in $managedGroups) {
@@ -995,11 +1016,7 @@ Department -like '*'
         # день, когда подразделение исчезло из 1С, рано — люди ещё переезжают.
         # Размораживается на шаге 4 по истечении карантина.
         if (-not $excelGroupKeys.ContainsKey($key)) {
-            if ($structuralKeys.ContainsKey($key)) {
-                Write-Log "Состав не трогаем (структурный узел, ведётся вручную): $($g.Name)" 'WARN'
-            } else {
-                Write-Log "Состав заморожен (нет в 1С, идёт карантин): $($g.Name)" 'WARN'
-            }
+            Write-Log "Состав заморожен (нет в 1С, идёт карантин): $($g.Name)" 'WARN'
             continue
         }
 
@@ -1111,9 +1128,9 @@ Department -like '*'
     # переименование, а главное — сохраняет SID, на котором держатся доступы:
     # группы рассылки вложены в группы Jira/Confluence, и удаление рвёт эту связь.
     Write-Log "Шаг 4: карантин и удаление групп, отсутствующих в 1С" 'STEP'
-    $finalGroups = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
+    $finalGroups = Remove-IgnoredGroups (Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
                                -SearchBase $TargetOU -Server $DcServer `
-                               -Properties Member, MemberOf, mail, Name, SamAccountName, info, objectSid
+                               -Properties Member, MemberOf, mail, Name, SamAccountName, info, objectSid)
 
     foreach ($g in $finalGroups) {
         $key         = Normalize-Name $g.Name
@@ -1133,13 +1150,6 @@ Department -like '*'
                     } catch { Write-Log "Снятие карантина не удалось $($g.Name): $($_.Exception.Message)" 'ERROR' }
                 }
             }
-            continue
-        }
-
-        # Структурный узел дерева рассылки: в 1С его нет и не будет, но под ним висят
-        # другие группы. Ни в карантин, ни в удаление — иначе развалится всё дерево.
-        if ($structuralKeys.ContainsKey($key)) {
-            Write-Log "Структурный узел, пропуск карантина и удаления: $($g.Name)" 'WARN'
             continue
         }
 
@@ -1218,8 +1228,8 @@ Department -like '*'
     Write-Log "Обновление реестра групп" 'STEP'
     $stamp = (Get-Date).ToString('yyyy-MM-dd')
     $liveSams = @{}
-    foreach ($g in (Get-ADGroup -LDAPFilter "(description=$GroupDesc)" -SearchBase $TargetOU -Server $DcServer `
-                                -Properties Name, SamAccountName, mail, info, objectSid)) {
+    foreach ($g in (Remove-IgnoredGroups (Get-ADGroup -LDAPFilter "(description=$GroupDesc)" -SearchBase $TargetOU -Server $DcServer `
+                                -Properties Name, SamAccountName, mail, info, objectSid))) {
         $liveSams[$g.SamAccountName] = $true
         $entry = $registry[$g.SamAccountName]
         if ($null -eq $entry) {
@@ -1250,11 +1260,7 @@ Department -like '*'
         $entry.Sid      = if ($g.objectSid) { $g.objectSid.Value } else { $entry.Sid }
         $entry.Mail     = $g.mail
         $entry.LastSeen = $stamp
-        # Structural закрепляется в реестре намеренно: это единственное, что защитит
-        # корень дерева, если его состав однажды окажется пустым.
-        $entry.Status   = if ($structuralKeys.ContainsKey((Normalize-Name $g.Name))) { 'Structural' }
-                          elseif ($g.info -match 'QUARANTINE:')                      { 'Quarantine' }
-                          else                                                       { 'Active' }
+        $entry.Status   = if ($g.info -match 'QUARANTINE:') { 'Quarantine' } else { 'Active' }
     }
     foreach ($sam in @($registry.Keys)) {
         if (-not $liveSams.ContainsKey($sam)) { $registry[$sam].Status = 'Deleted' }
