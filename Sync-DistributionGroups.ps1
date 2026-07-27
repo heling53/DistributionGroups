@@ -577,6 +577,10 @@ Department -like '*'
             QuarantineSince = $quarantineSince
             KnownNames      = $knownNames
             ExternalParents = @($g.MemberOf | Where-Object { -not $managedDNs.ContainsKey($_) })
+            # Сколько групп рассылки вложено внутрь. Ненулевое значение означает узел
+            # структуры рассылки, а не подразделение: такие узлы (например, общая
+            # группа «все сотрудники») в выгрузке 1С не встречаются в принципе.
+            ChildGroups     = @($g.Member | Where-Object { $managedDNs.ContainsKey($_) }).Count
             AgeDays         = if ($g.whenCreated) { ((Get-Date) - $g.whenCreated).TotalDays } else { [double]::MaxValue }
         }
         $groupInfo.Add($obj)
@@ -591,11 +595,31 @@ Department -like '*'
         return $protectedByEmail.ContainsKey($GroupObj.Mail.ToLowerInvariant().Trim())
     }
 
+    # Структурный узел — группа, внутрь которой вложены другие группы рассылки, но
+    # которой самой нет в 1С. Такие узлы заводят руками (исторически — через отдельный
+    # файл иерархии ImportedDeps.csv, от которого отказались в пользу выгрузки 1С),
+    # и в справочнике они не появятся никогда. Ни переименовывать их, ни гасить,
+    # ни удалять нельзя: под ними висит всё дерево рассылки.
+    # Признак берём и из текущего состава, и из реестра: узел, однажды опознанный
+    # структурным, остаётся защищённым, даже если его временно опустошили руками.
+    $structural = @($groupInfo | Where-Object {
+        (-not $excelGroupKeys.ContainsKey($_.Key)) -and
+        ($_.ChildGroups -gt 0 -or
+         ($registry.ContainsKey($_.Sam) -and $registry[$_.Sam].Status -eq 'Structural'))
+    })
+    $structuralKeys = @{}
+    foreach ($s in $structural) {
+        $structuralKeys[$s.Key] = $true
+        Write-Log ("Структурный узел (нет в 1С, вложено групп: {0}) — не трогаем: {1}" -f $s.ChildGroups, $s.Name) 'WARN'
+    }
+
     # Осиротевшая группа — та, чьего названия больше нет в выгрузке 1С. Именно это
     # событие отличает переименование от перевода сотрудника: при переводе исходное
     # подразделение остаётся в справочнике, и уход одного человека ничего не значит.
     $orphans = @($groupInfo | Where-Object {
-        (-not $excelGroupKeys.ContainsKey($_.Key)) -and -not (Test-Protected $_)
+        (-not $excelGroupKeys.ContainsKey($_.Key)) -and
+        (-not $structuralKeys.ContainsKey($_.Key)) -and
+        -not (Test-Protected $_)
     })
 
     # Получателем может быть подразделение, у которого группы ещё нет, либо у которого
@@ -971,7 +995,11 @@ Department -like '*'
         # день, когда подразделение исчезло из 1С, рано — люди ещё переезжают.
         # Размораживается на шаге 4 по истечении карантина.
         if (-not $excelGroupKeys.ContainsKey($key)) {
-            Write-Log "Состав заморожен (нет в 1С, идёт карантин): $($g.Name)" 'WARN'
+            if ($structuralKeys.ContainsKey($key)) {
+                Write-Log "Состав не трогаем (структурный узел, ведётся вручную): $($g.Name)" 'WARN'
+            } else {
+                Write-Log "Состав заморожен (нет в 1С, идёт карантин): $($g.Name)" 'WARN'
+            }
             continue
         }
 
@@ -1108,6 +1136,13 @@ Department -like '*'
             continue
         }
 
+        # Структурный узел дерева рассылки: в 1С его нет и не будет, но под ним висят
+        # другие группы. Ни в карантин, ни в удаление — иначе развалится всё дерево.
+        if ($structuralKeys.ContainsKey($key)) {
+            Write-Log "Структурный узел, пропуск карантина и удаления: $($g.Name)" 'WARN'
+            continue
+        }
+
         # Защищённые в protected_groups.json не трогаем вовсе.
         $email = if ($g.mail) { $g.mail.ToLowerInvariant().Trim() } else { $null }
         if ($email -and $protectedByEmail.ContainsKey($email)) {
@@ -1215,7 +1250,11 @@ Department -like '*'
         $entry.Sid      = if ($g.objectSid) { $g.objectSid.Value } else { $entry.Sid }
         $entry.Mail     = $g.mail
         $entry.LastSeen = $stamp
-        $entry.Status   = if ($g.info -match 'QUARANTINE:') { 'Quarantine' } else { 'Active' }
+        # Structural закрепляется в реестре намеренно: это единственное, что защитит
+        # корень дерева, если его состав однажды окажется пустым.
+        $entry.Status   = if ($structuralKeys.ContainsKey((Normalize-Name $g.Name))) { 'Structural' }
+                          elseif ($g.info -match 'QUARANTINE:')                      { 'Quarantine' }
+                          else                                                       { 'Active' }
     }
     foreach ($sam in @($registry.Keys)) {
         if (-not $liveSams.ContainsKey($sam)) { $registry[$sam].Status = 'Deleted' }

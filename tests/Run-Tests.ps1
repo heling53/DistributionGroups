@@ -421,6 +421,52 @@ Check 'действующий псевдоним остался' (@($al | Where-
 
 ''
 '============================================================'
+'ТЕСТ 16. Структурный узел «Все сотрудники» вне 1С не трогается'
+'============================================================'
+Reset-Store; Build-BaseOrg; Invoke-Sync
+# Корень дерева рассылки заведён руками: его нет и не будет в выгрузке 1С,
+# а внутрь него вложены «Руководство» и все отделы (но не друг в друга).
+$global:ADStore.Groups += [PSCustomObject]@{
+    DistinguishedName = "CN=Все сотрудники,$OU"
+    Name = 'Все сотрудники'; SamAccountName = 'DG_VS'; DisplayName = 'Все сотрудники'
+    Description = $Desc; Member = @(); MemberOf = @(); ManagedBy = $null
+    mail = 'dg_vs@transitcard.ru'; info = $null; whenCreated = (Get-Date).AddDays(-500)
+    objectSid = [PSCustomObject]@{ Value = 'S-1-5-21-1-1-1-500' }
+    HiddenFromAddressListsEnabled = $false
+}
+$root = Get-G 'Все сотрудники'
+foreach ($n in @('Отдел продаж','Отдел закупок','Коммерческий блок')) {
+    $child = Get-G $n
+    $root.Member   += $child.DistinguishedName
+    $child.MemberOf += $root.DistinguishedName
+}
+$sidRoot = $root.objectSid.Value
+Invoke-Sync
+Check 'структурный узел опознан' ($script:LastOutput -match 'Структурный узел')
+Check 'корень жив' ($null -ne (Get-G 'Все сотрудники'))
+Check 'корень не в карантине' (-not (Get-G 'Все сотрудники').info)
+Check 'корень не скрыт из адресной книги' (-not (Get-G 'Все сотрудники').HiddenFromAddressListsEnabled)
+Check 'ручная вложенность сохранена (3 группы)' (@((Get-G 'Все сотрудники').Member).Count -eq 3) "= $(@((Get-G 'Все сотрудники').Member).Count)"
+Check 'в реестре помечен как Structural' (@(Read-Json 'department_registry.json' | Where-Object { $_.Sam -eq 'DG_VS' }).Status -eq 'Structural')
+
+# Отдел расформирован: корень не должен быть принят за кандидата на переименование.
+Set-Excel @( @{ Child = 'Отдел закупок'; Parent = 'Коммерческий блок'; Manager = '2001' } )
+Move-Users -Sams (@('boss.sales') + (1..11 | ForEach-Object { "sales$_" })) -ToDept 'Отдел закупок'
+Invoke-Sync
+Check 'корень не переименован в исчезнувший отдел' ((Get-G 'Все сотрудники').objectSid.Value -eq $sidRoot)
+(Get-G 'Отдел продаж').info = "QUARANTINE:{0:yyyy-MM-dd}" -f (Get-Date).AddDays(-40)
+Invoke-Sync
+Check 'после чужого удаления корень цел' ($null -ne (Get-G 'Все сотрудники'))
+Check 'корень так и не в карантине' (-not (Get-G 'Все сотрудники').info)
+
+# Корень временно опустошили руками — защита держится по реестру.
+(Get-G 'Все сотрудники').Member = @()
+Invoke-Sync
+Check 'пустой корень защищён реестром' ($null -ne (Get-G 'Все сотрудники'))
+Check 'пустой корень не в карантине' (-not (Get-G 'Все сотрудники').info)
+
+''
+'============================================================'
 "ИТОГО: успешно $script:Pass, провалено $script:Fail"
 if ($script:Fail -gt 0) { 'Провалены:'; $script:Failures | ForEach-Object { "  - $_" } }
 '============================================================'
