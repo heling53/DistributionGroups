@@ -28,7 +28,11 @@ param(
     [string]$ExcelPath               = 'D:\Scripts\verify1C\1c\Подразделения.xlsx',
     [string]$LogPath                 = 'D:\Scripts\Группы рассылки\Logs',
     [int]$SamMaxLength               = 20,
-    [string]$UsersCorpOU             = 'OU=Users.Corp,DC=transitcard,DC=ru'
+    [string]$UsersCorpOU             = 'OU=Users.Corp,DC=transitcard,DC=ru',
+    # Кастомная верхнеуровневая структура. «Руководство» приходит из 1С, «Все сотрудники» — нет
+    # (создаётся один раз скриптом New-AllEmployeesGroup.ps1 с адресом employees@<MailDomain>).
+    [string]$LeadershipGroupName     = 'Руководство',
+    [string]$AllEmployeesGroupName   = 'Все сотрудники'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -210,6 +214,10 @@ try {
     foreach ($d in $departments) {
         $excelGroupKeys[(Normalize-Name $d)] = $true
     }
+    # «Все сотрудники» — кастомная верхнеуровневая группа, которой нет в выгрузке 1С.
+    # Добавляем её в набор «обязательно существующих», чтобы Шаг 4 никогда её не удалял
+    # (даже если в какой-то момент она временно окажется пустой).
+    $excelGroupKeys[(Normalize-Name $AllEmployeesGroupName)] = $true
 
     # ==========================================
     # ШАГ 1. Создание групп из справочника 1С
@@ -382,11 +390,37 @@ Department -like '*'
     # ==========================================
     # ШАГ 3. Иерархия из 1С (Excel)
     # ==========================================
+    # Подмена маппинга «Руководство» <-> «Все сотрудники»:
+    #   «Руководство» больше НЕ верхнеуровневая группа, в которую входят все. Везде, где
+    #   1С указывает родителем (вершиной) «Руководство», подставляем кастомную группу
+    #   «Все сотрудники» (employees@), которой в выгрузке 1С нет. В итоге бывшие прямые
+    #   подчинённые «Руководство» вкладываются в «Все сотрудники», а саму «Руководство»
+    #   отдельным ребром вкладываем в «Все сотрудники» в конце шага.
     Write-Log "Шаг 3: иерархия" 'STEP'
+
+    $leadershipKey   = Normalize-Name $LeadershipGroupName
+    $allEmployeesKey = Normalize-Name $AllEmployeesGroupName
+    if (-not $managedGroupsMap.ContainsKey($allEmployeesKey)) {
+        Write-Log ("Кастомная группа '{0}' не найдена в {1}. Создайте её один раз скриптом New-AllEmployeesGroup.ps1 (employees@{2}). Верхний уровень иерархии построен не будет." -f `
+            $AllEmployeesGroupName, $TargetOU, $MailDomain) 'ERROR'
+    }
+
     foreach ($row in $excelHierarchy) {
-        $parentKey = Normalize-Name $row.Parent
         $childKey  = Normalize-Name $row.Child
-        if (-not $managedGroupsMap.ContainsKey($parentKey)) { Write-Log "Родитель '$($row.Parent)' не найден" 'WARN'; continue }
+        $parentKey = Normalize-Name $row.Parent
+
+        # «Руководство» вкладываем только в «Все сотрудники» (ниже, явным ребром),
+        # поэтому её собственные родительские связи из 1С здесь игнорируем.
+        if ($childKey -eq $leadershipKey) { continue }
+
+        # Подмена родителя: «Руководство» -> «Все сотрудники».
+        $parentName = $row.Parent
+        if ($parentKey -eq $leadershipKey) {
+            $parentKey  = $allEmployeesKey
+            $parentName = $AllEmployeesGroupName
+        }
+
+        if (-not $managedGroupsMap.ContainsKey($parentKey)) { Write-Log "Родитель '$parentName' не найден" 'WARN'; continue }
         if (-not $managedGroupsMap.ContainsKey($childKey))  { Write-Log "Потомок '$($row.Child)' не найден"  'WARN'; continue }
         $parent = $managedGroupsMap[$parentKey]
         $child  = $managedGroupsMap[$childKey]
@@ -400,6 +434,24 @@ Department -like '*'
                 Write-Log "Иерархия fail: $($_.Exception.Message)" 'ERROR'
             }
         }
+    }
+
+    # Саму «Руководство» вкладываем в «Все сотрудники» (явное ребро верхнего уровня).
+    if ($managedGroupsMap.ContainsKey($leadershipKey) -and $managedGroupsMap.ContainsKey($allEmployeesKey)) {
+        $leadershipGroup   = $managedGroupsMap[$leadershipKey]
+        $allEmployeesGroup = $managedGroupsMap[$allEmployeesKey]
+        try {
+            if ($PSCmdlet.ShouldProcess("$($leadershipGroup.Name) -> $($allEmployeesGroup.Name)", "Add child group")) {
+                Add-ADGroupMember -Identity $allEmployeesGroup -Members $leadershipGroup -Server $DcServer -ErrorAction Stop
+                Write-Log "Иерархия: $($leadershipGroup.Name) -> $($allEmployeesGroup.Name)" 'OK'
+            }
+        } catch {
+            if ($_.Exception.Message -notmatch 'already a member') {
+                Write-Log "Иерархия fail ($($leadershipGroup.Name) -> $($allEmployeesGroup.Name)): $($_.Exception.Message)" 'ERROR'
+            }
+        }
+    } elseif (-not $managedGroupsMap.ContainsKey($leadershipKey)) {
+        Write-Log "Группа '$LeadershipGroupName' не найдена — не удалось вложить её в '$AllEmployeesGroupName'" 'WARN'
     }
 
     # ==========================================

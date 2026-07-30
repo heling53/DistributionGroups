@@ -4,6 +4,12 @@ $LogFile      = "D:\Scripts\DistributionGroups\task.log"
 $ExcelPath    = "D:\Scripts\verify1C\1c\Подразделения.xlsx"
 $ExcelSheet   = "Лист_1"
 
+# Кастомная верхнеуровневая структура (синхронно со Sync-DistributionGroups.ps1):
+# «Руководство» приходит из 1С, но больше не является корнем — она вложена в кастомную
+# группу «Все сотрудники», которой в выгрузке 1С нет.
+$LeadershipGroupName   = "Руководство"
+$AllEmployeesGroupName = "Все сотрудники"
+
 # CSV-файлы
 $Csv_NonCorrADGroup        = "D:\Scripts\DistributionGroups\NonCorrADGroup.csv"
 $Csv_NCMUpload             = "D:\Scripts\DistributionGroups\NCMUpload.csv"
@@ -304,8 +310,19 @@ function Test-GroupHierarchy {
     foreach ($Department in $AllNotes) {
         $CurrDep = $Department.'Полное наименование пдоразделения'
         $HeadDep = $Department.'Наименование подразделения (вершины)'
-        if ($CurrDep -eq "Руководство") { continue }
-        if ([string]::IsNullOrWhiteSpace($HeadDep)) { continue }
+
+        # «Руководство» больше не верхнеуровневая группа: теперь она сама вложена
+        # в кастомную «Все сотрудники». Проверяем именно это вхождение.
+        if ($CurrDep -eq $LeadershipGroupName) {
+            $HeadDep = $AllEmployeesGroupName
+        }
+        elseif ([string]::IsNullOrWhiteSpace($HeadDep)) {
+            continue
+        }
+        # Везде, где 1С указывает вершиной «Руководство», фактическая вершина — «Все сотрудники».
+        elseif ($HeadDep -eq $LeadershipGroupName) {
+            $HeadDep = $AllEmployeesGroupName
+        }
 
         $targetGroup = Find-GroupMatch -SearchName $CurrDep -Map $GroupByDisplayName
         $parentGroup = Find-GroupMatch -SearchName $HeadDep -Map $GroupByDisplayName
@@ -471,6 +488,9 @@ function Find-ObsoleteGroups {
     foreach ($Group in $DGroups) {
         $cn = if ($Group.CN)          { $Group.CN.Trim() }          else { '' }
         $dn = if ($Group.DisplayName) { $Group.DisplayName.Trim() } else { '' }
+
+        # «Все сотрудники» — кастомная группа, которой намеренно нет в 1С. Не считаем устаревшей.
+        if ($cn -eq $AllEmployeesGroupName -or $dn -eq $AllEmployeesGroupName) { continue }
 
         # Группа актуальна, если её имя (CN или DisplayName) есть среди подразделений 1С.
         if ($currentDepNames.ContainsKey($cn) -or $currentDepNames.ContainsKey($dn)) { continue }
